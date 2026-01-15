@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod:*)",
+      "Bash(python3:*)",
+      "Bash(uv python install:*)",
+      "Bash(uv python run:*)",
+      "Bash(uv run python:*)"
+    ]
+  }
+}
