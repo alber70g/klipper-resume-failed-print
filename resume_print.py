@@ -16,6 +16,8 @@ class PrintResumeTool:
         self.layer_height = 0.2  # Default, adjust as needed
         self.resume_height = None
         self.gcode_file = None
+        self.bed_temp = None
+        self.hotend_temp = None
 
     def parse_arguments(self):
         parser = argparse.ArgumentParser(
@@ -53,6 +55,16 @@ class PrintResumeTool:
             default=30,
             help='Y position for safe Z homing'
         )
+        parser.add_argument(
+            '--bed-temp',
+            type=float,
+            help='Bed temperature (auto-detected if not specified)'
+        )
+        parser.add_argument(
+            '--hotend-temp',
+            type=float,
+            help='Hotend temperature (auto-detected if not specified)'
+        )
 
         args = parser.parse_args()
         self.gcode_file = args.gcode_file
@@ -69,16 +81,106 @@ class PrintResumeTool:
 
         self.safe_z_home_x = args.safe_z_home_x
         self.safe_z_home_y = args.safe_z_home_y
+        self.bed_temp = args.bed_temp
+        self.hotend_temp = args.hotend_temp
+
+    def extract_temperatures(self, content):
+        """Extract bed and hotend temperatures from original G-code.
+
+        Searches for:
+        - Klipper PRINT_START macro: PRINT_START BED=85 HOTEND=230
+        - Standard G-code: M140 S85 (bed), M104 S230 (hotend)
+        - With wait: M190 S85 (bed), M109 S230 (hotend)
+        """
+        bed_temp = None
+        hotend_temp = None
+
+        # Only search first 500 lines (start section)
+        search_lines = content[:500]
+
+        for line in search_lines:
+            line = line.strip()
+
+            # Check for Klipper PRINT_START macro
+            print_start_match = re.search(
+                r'PRINT_START.*BED=(\d+).*HOTEND=(\d+)',
+                line, re.IGNORECASE
+            )
+            if print_start_match:
+                bed_temp = int(print_start_match.group(1))
+                hotend_temp = int(print_start_match.group(2))
+                break
+
+            # Check for standard M140/M190 (bed temperature)
+            if bed_temp is None:
+                bed_match = re.search(r'M1[49]0\s+S(\d+)', line)
+                if bed_match and int(bed_match.group(1)) > 0:
+                    bed_temp = int(bed_match.group(1))
+
+            # Check for standard M104/M109 (hotend temperature)
+            if hotend_temp is None:
+                hotend_match = re.search(r'M10[49]\s+S(\d+)', line)
+                if hotend_match and int(hotend_match.group(1)) > 0:
+                    hotend_temp = int(hotend_match.group(1))
+
+            # Stop if we found both
+            if bed_temp is not None and hotend_temp is not None:
+                break
+
+        return bed_temp, hotend_temp
+
+    def find_layer_changes_with_z(self, content):
+        """Find all layer change markers with their Z heights from slicer comments.
+
+        Returns list of tuples: (line_number, z_height)
+        Supports multiple slicer formats.
+        """
+        layers = []
+
+        # Pattern for ;Z: markers (OrcaSlicer, PrusaSlicer, Cura)
+        z_comment_pattern = r'^;Z:([\d.]+)'
+        # Pattern for ;LAYER:n followed by finding Z
+        layer_num_pattern = r'^;LAYER:(\d+)'
+        # Pattern for ; layer n, z = X.XX (some PrusaSlicer versions)
+        layer_z_pattern = r'^; layer \d+, z = ([\d.]+)'
+
+        i = 0
+        while i < len(content):
+            line = content[i].strip()
+
+            # Check for ;Z: marker (most reliable)
+            match = re.match(z_comment_pattern, line)
+            if match:
+                z_height = float(match.group(1))
+                # Look back for LAYER_CHANGE marker
+                layer_start = i
+                for j in range(max(0, i - 5), i):
+                    if ';LAYER_CHANGE' in content[j] or re.match(layer_num_pattern, content[j].strip()):
+                        layer_start = j
+                        break
+                layers.append((layer_start, z_height))
+                i += 1
+                continue
+
+            # Check for ; layer n, z = X.XX format
+            match = re.match(layer_z_pattern, line)
+            if match:
+                z_height = float(match.group(1))
+                layers.append((i, z_height))
+                i += 1
+                continue
+
+            i += 1
+
+        return layers
 
     def find_layer_changes(self, content):
-        """Find all layer change markers in G-code"""
+        """Find all layer change markers in G-code (legacy method)"""
         layer_patterns = [
-            r';LAYER_CHANGE',            # Cura
+            r';LAYER_CHANGE',            # Cura/OrcaSlicer
             r';LAYER:(\d+)',             # Cura/Slic3r
             r';BEFORE_LAYER_CHANGE',     # Cura
-            r';AFTER_LAYER_CHANGE',      # Cura
             r'^; layer (\d+)',           # PrusaSlicer
-            r'^;MESH:NONMESH',           # End of mesh
         ]
 
         layer_lines = []
@@ -90,7 +192,11 @@ class PrintResumeTool:
         return layer_lines
 
     def find_z_moves(self, content):
-        """Extract Z positions and their line numbers"""
+        """Extract Z positions from G-code moves (fallback method).
+
+        Note: This includes travel moves which may have elevated Z.
+        Prefer find_layer_changes_with_z() for accurate layer heights.
+        """
         z_moves = []
         z_pattern = r'G[01].*Z([-\d.]+)'
 
@@ -108,7 +214,38 @@ class PrintResumeTool:
         return z_moves
 
     def find_resume_layer(self, content, target_height):
-        """Find the best layer to resume from"""
+        """Find the best layer to resume from.
+
+        Uses slicer Z markers (;Z:) for accurate layer detection,
+        falls back to G-code Z moves if markers not found.
+        """
+        # Try to find layers with Z heights from slicer comments (most accurate)
+        layers_with_z = self.find_layer_changes_with_z(content)
+
+        if layers_with_z:
+            print(f"Found {len(layers_with_z)} layers with Z markers")
+
+            # Find first layer where Z >= target - layer_height
+            threshold = target_height - self.layer_height
+            resume_line = None
+            resume_z = None
+
+            for line_num, z_height in layers_with_z:
+                if z_height >= threshold:
+                    resume_line = line_num
+                    resume_z = z_height
+                    break
+
+            if resume_line is not None:
+                print(f"Found resume layer at Z:{resume_z}mm (line {resume_line})")
+                return resume_line
+            else:
+                # Use last layer if target is beyond all layers
+                print("Warning: Target height beyond all layers, using last layer")
+                return layers_with_z[-1][0]
+
+        # Fallback: use legacy method with layer markers and Z moves
+        print("Warning: No ;Z: markers found, using fallback detection")
         layer_indices = self.find_layer_changes(content)
         z_moves = self.find_z_moves(content)
 
@@ -118,13 +255,14 @@ class PrintResumeTool:
 
         # Find the layer where Z reaches or exceeds target height
         resume_layer_idx = None
+        threshold = target_height - self.layer_height
 
         for i, layer_line in enumerate(layer_indices):
             # Find Z position after this layer change
             for z_line, z_pos in z_moves:
                 if z_line > layer_line:
                     # Found the first Z move after layer change
-                    if z_pos >= target_height - self.layer_height:
+                    if z_pos >= threshold:
                         resume_layer_idx = i
                         break
             if resume_layer_idx is not None:
@@ -198,30 +336,97 @@ class PrintResumeTool:
         return filtered_content
 
     def create_resume_header(self):
-        """Create G-code header for resume"""
+        """Create G-code header for resume with automated workflow.
+
+        Workflow:
+        1. Heat bed and hotend to original temperatures
+        2. Home X and Y axes
+        3. PAUSE - user manually positions nozzle to resume height
+        4. After RESUME: set Z position and continue printing
+        """
         header = [
             '; === PRINT RESUME TOOL ===\n',
             '; Resume height: {:.2f}mm\n'.format(self.resume_height),
             '; Layer height: {:.2f}mm\n'.format(self.layer_height),
+        ]
+
+        if self.bed_temp:
+            header.append('; Bed temperature: {}C\n'.format(self.bed_temp))
+        if self.hotend_temp:
+            header.append('; Hotend temperature: {}C\n'.format(self.hotend_temp))
+
+        header.extend([
             ';\n',
-            '; IMPORTANT: Perform these steps BEFORE printing:\n',
-            '; 1. Heat bed to print temperature\n',
-            '; 2. Heat nozzle to print temperature\n',
-            '; 3. Home XY: G28 X Y\n',
-            '; 4. Home Z at safe position: G28 Z\n',
-            '; 5. Manually move nozzle to resume height\n',
+            '; WORKFLOW:\n',
+            '; 1. File will heat bed and nozzle automatically\n',
+            '; 2. File will home X and Y automatically\n',
+            '; 3. Printer will PAUSE - move nozzle to Z={:.2f}mm manually\n'.format(self.resume_height),
+            '; 4. Click RESUME to continue printing\n',
             ';\n',
-            'M83 ; Extruder relative\n',
-            'G90 ; Absolute positioning\n',
-            'M107 ; Fan off\n',
-            ';\n',
-            '; Set current Z position\n',
-            'G92 Z{:.3f} ; Set current Z to resume height\n'.format(self.resume_height),
-            ';\n',
+            '\n',
+            '; === START RESUME SEQUENCE ===\n',
+            '\n',
+            '; Set absolute positioning\n',
+            'G90\n',
+            '\n',
+        ])
+
+        # Add temperature commands if available
+        if self.bed_temp and self.hotend_temp:
+            header.extend([
+                '; Heat bed and nozzle\n',
+                'M140 S{} ; Set bed temperature\n'.format(self.bed_temp),
+                'M104 S{} ; Set hotend temperature\n'.format(self.hotend_temp),
+                'M190 S{} ; Wait for bed temperature\n'.format(self.bed_temp),
+                'M109 S{} ; Wait for hotend temperature\n'.format(self.hotend_temp),
+                '\n',
+            ])
+        elif self.bed_temp:
+            header.extend([
+                '; Heat bed (hotend temp not detected - set manually before starting)\n',
+                'M140 S{} ; Set bed temperature\n'.format(self.bed_temp),
+                'M190 S{} ; Wait for bed temperature\n'.format(self.bed_temp),
+                '\n',
+            ])
+        elif self.hotend_temp:
+            header.extend([
+                '; Heat hotend (bed temp not detected - set manually before starting)\n',
+                'M104 S{} ; Set hotend temperature\n'.format(self.hotend_temp),
+                'M109 S{} ; Wait for hotend temperature\n'.format(self.hotend_temp),
+                '\n',
+            ])
+        else:
+            header.extend([
+                '; WARNING: Temperatures not detected!\n',
+                '; Heat bed and nozzle manually before starting this file.\n',
+                '\n',
+            ])
+
+        header.extend([
+            '; Home X and Y axes\n',
+            'G28 X Y\n',
+            '\n',
+            '; === PAUSE FOR MANUAL NOZZLE POSITIONING ===\n',
+            '; Move the nozzle to Z={:.2f}mm above the print surface\n'.format(self.resume_height),
+            '; Use the LCD or web interface to jog Z to the correct height\n',
+            '; The nozzle should be approximately one layer height above the last printed layer\n',
+            'PAUSE MSG="Move nozzle to Z={:.2f}mm, then click RESUME"\n'.format(self.resume_height),
+            '\n',
+            '; === AFTER RESUME ===\n',
+            '; Set current Z position to resume height\n',
+            'G92 Z{:.3f}\n'.format(self.resume_height),
+            '\n',
             '; Reset extruder position\n',
             'G92 E0\n',
-            ';\n',
-        ]
+            '\n',
+            '; Set modes for printing\n',
+            'M83 ; Extruder relative mode\n',
+            'G90 ; Absolute positioning\n',
+            '\n',
+            '; === BEGIN RESUMED PRINT ===\n',
+            '\n',
+        ])
+
         return header
 
     def process_gcode(self):
@@ -233,6 +438,24 @@ class PrintResumeTool:
         # Read original file
         with open(self.gcode_file, 'r') as f:
             content = f.readlines()
+
+        # Extract temperatures if not provided via command line
+        if self.bed_temp is None or self.hotend_temp is None:
+            detected_bed, detected_hotend = self.extract_temperatures(content)
+            if self.bed_temp is None:
+                self.bed_temp = detected_bed
+            if self.hotend_temp is None:
+                self.hotend_temp = detected_hotend
+
+        if self.bed_temp:
+            print(f"Bed temperature: {self.bed_temp}°C")
+        else:
+            print("Warning: Bed temperature not detected")
+
+        if self.hotend_temp:
+            print(f"Hotend temperature: {self.hotend_temp}°C")
+        else:
+            print("Warning: Hotend temperature not detected")
 
         # Find where to resume
         resume_line = self.find_resume_layer(content, self.resume_height)
@@ -254,13 +477,13 @@ class PrintResumeTool:
             f.writelines(output_content)
 
         print(f"\n✓ Created resume file: {self.output_file}")
-        print("\n=== NEXT STEPS ===")
-        print("1. Heat bed to print temperature")
-        print("2. Heat nozzle to print temperature")
-        print("3. Home XY: G28 X Y")
-        print(f"4. Home Z at safe position: G28 Z (or use safe_z_home)")
-        print("5. Manually move nozzle to resume height")
-        print(f"6. Start print: {self.output_file}")
+        print("\n=== WORKFLOW ===")
+        print(f"1. Upload {self.output_file} to your printer")
+        print("2. Start the print")
+        print("3. Printer will heat up and home X/Y automatically")
+        print("4. Printer will PAUSE")
+        print(f"5. Manually move nozzle to Z={self.resume_height}mm")
+        print("6. Click RESUME to continue printing")
         print("\n⚠️  IMPORTANT: Monitor first few layers carefully!")
 
     def create_macro_version(self):
