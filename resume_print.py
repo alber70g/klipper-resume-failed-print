@@ -75,9 +75,14 @@ class PrintResumeTool:
             self.output_file = args.output
         else:
             orig_path = Path(args.gcode_file)
-            self.output_file = str(orig_path.with_name(
-                f"{orig_path.stem}_resumed{orig_path.suffix}"
-            ))
+            candidate = orig_path.with_name(f"{orig_path.stem}_resumed{orig_path.suffix}")
+            counter = 1
+            while candidate.exists():
+                candidate = orig_path.with_name(
+                    f"{orig_path.stem}_resumed_{counter}{orig_path.suffix}"
+                )
+                counter += 1
+            self.output_file = str(candidate)
 
         self.safe_z_home_x = args.safe_z_home_x
         self.safe_z_home_y = args.safe_z_home_y
@@ -366,6 +371,9 @@ class PrintResumeTool:
             '\n',
             '; === START RESUME SEQUENCE ===\n',
             '\n',
+            'M117 Resume: heating up...\n',
+            'RESPOND MSG="Resume print: heating bed and nozzle"\n',
+            '\n',
             '; Set absolute positioning\n',
             'G90\n',
             '\n',
@@ -404,17 +412,26 @@ class PrintResumeTool:
 
         header.extend([
             '; Home X and Y axes\n',
+            'M117 Resume: homing X Y...\n',
+            'RESPOND MSG="Resume print: homing X and Y"\n',
             'G28 X Y\n',
             '\n',
+            '; Tell Klipper the approximate Z position so PAUSE macro can do Z-hop\n',
+            'SET_KINEMATIC_POSITION Z={:.3f}\n'.format(self.resume_height),
+            '\n',
+            '; Move to safe park position so RESUME restores to a valid XY location\n',
+            'G1 X10 Y10 F3000\n',
+            '\n',
             '; === PAUSE FOR MANUAL NOZZLE POSITIONING ===\n',
-            '; Move the nozzle to Z={:.2f}mm above the print surface\n'.format(self.resume_height),
-            '; Use the LCD or web interface to jog Z to the correct height\n',
-            '; The nozzle should be approximately one layer height above the last printed layer\n',
+            'M117 jog Z to {:.2f}mm\n'.format(self.resume_height),
+            'RESPOND MSG="ACTION: Jog nozzle to Z={:.2f}mm, then click RESUME"\n'.format(self.resume_height),
             'PAUSE MSG="Move nozzle to Z={:.2f}mm, then click RESUME"\n'.format(self.resume_height),
             '\n',
             '; === AFTER RESUME ===\n',
-            '; Set current Z position to resume height\n',
-            'G92 Z{:.3f}\n'.format(self.resume_height),
+            'M117 Resume: printing from {:.2f}mm\n'.format(self.resume_height),
+            'RESPOND MSG="Resume print: continuing from Z={:.2f}mm"\n'.format(self.resume_height),
+            '; Tell Klipper the current physical Z position without moving motors\n',
+            'SET_KINEMATIC_POSITION Z={:.3f}\n'.format(self.resume_height),
             '\n',
             '; Reset extruder position\n',
             'G92 E0\n',
