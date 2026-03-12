@@ -7,7 +7,9 @@
       "Bash(uv python run:*)",
       "Bash(uv run python:*)",
       "mcp__exa__web_search_exa",
-      "mcp__exa__crawling_exa"
+      "mcp__exa__crawling_exa",
+      "mcp__tavily__tavily_search",
+      "mcp__tavily__tavily_extract"
     ]
   }
 }
