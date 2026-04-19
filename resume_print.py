@@ -345,9 +345,10 @@ class PrintResumeTool:
 
         Workflow:
         1. Heat bed and hotend to original temperatures
-        2. Home X and Y axes
-        3. PAUSE - user manually positions nozzle to resume height
-        4. After RESUME: set Z position and continue printing
+        2. Home X and Y axes only (Z left unhomed for free movement)
+        3. Set fake Z=200 so soft limits allow full downward jogging
+        4. PAUSE - user manually jogs Z down to resume height
+        5. After RESUME: set real Z position and continue printing
         """
         header = [
             '; === PRINT RESUME TOOL ===\n',
@@ -364,8 +365,8 @@ class PrintResumeTool:
             ';\n',
             '; WORKFLOW:\n',
             '; 1. File will heat bed and nozzle automatically\n',
-            '; 2. File will home X and Y automatically\n',
-            '; 3. Printer will PAUSE - move nozzle to Z={:.2f}mm manually\n'.format(self.resume_height),
+            '; 2. File will home X and Y (Z left unhomed for free movement)\n',
+            '; 3. Printer will PAUSE - jog Z down to {:.2f}mm manually\n'.format(self.resume_height),
             '; 4. Click RESUME to continue printing\n',
             ';\n',
             '\n',
@@ -416,16 +417,14 @@ class PrintResumeTool:
             'RESPOND MSG="Resume print: homing X and Y"\n',
             'G28 X Y\n',
             '\n',
-            '; Tell Klipper the approximate Z position so PAUSE macro can do Z-hop\n',
-            'SET_KINEMATIC_POSITION Z={:.3f}\n'.format(self.resume_height),
-            '\n',
-            '; Move to safe park position so RESUME restores to a valid XY location\n',
-            'G1 X10 Y10 F3000\n',
+            '; Set Z high so soft limits allow full downward jogging\n',
+            'SET_KINEMATIC_POSITION Z=200\n',
             '\n',
             '; === PAUSE FOR MANUAL NOZZLE POSITIONING ===\n',
-            'M117 jog Z to {:.2f}mm\n'.format(self.resume_height),
-            'RESPOND MSG="ACTION: Jog nozzle to Z={:.2f}mm, then click RESUME"\n'.format(self.resume_height),
-            'PAUSE MSG="Move nozzle to Z={:.2f}mm, then click RESUME"\n'.format(self.resume_height),
+            '; Z is NOT homed - jog Z freely to position nozzle at the print surface\n',
+            'M117 jog Z to {:.2f}mm then RESUME\n'.format(self.resume_height),
+            'RESPOND MSG="ACTION: Jog nozzle DOWN to Z={:.2f}mm (Z not homed - free movement), then click RESUME"\n'.format(self.resume_height),
+            'PAUSE\n',
             '\n',
             '; === AFTER RESUME ===\n',
             'M117 Resume: printing from {:.2f}mm\n'.format(self.resume_height),
