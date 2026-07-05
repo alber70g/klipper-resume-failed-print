@@ -34,6 +34,13 @@ class PrintResumeTool:
             help='Z-height to resume from (in mm)'
         )
         parser.add_argument(
+            '--object',
+            type=int,
+            default=None,
+            help='For sequential ("by object") prints where Z restarts per object: '
+                 '1-based index of the object that failed. Run without it to list objects.'
+        )
+        parser.add_argument(
             '--output', '-o',
             help='Output file name (default: original_filename_resumed.gcode)'
         )
@@ -70,6 +77,7 @@ class PrintResumeTool:
         self.gcode_file = args.gcode_file
         self.resume_height = args.height
         self.layer_height = args.layer_height
+        self.object_index = args.object
 
         if args.output:
             self.output_file = args.output
@@ -134,6 +142,48 @@ class PrintResumeTool:
 
         return bed_temp, hotend_temp
 
+    def extract_temperatures_at(self, content, resume_line):
+        """Detect the temperatures active at the resume point.
+
+        Scans backward from the cut for the last M104/M140 with S>0. This picks
+        up the print temperature rather than the (often hotter) first-layer
+        temperature from the start section.
+        """
+        bed_temp = None
+        hotend_temp = None
+
+        for line in reversed(content[:resume_line]):
+            clean = line.split(';')[0]
+            if hotend_temp is None:
+                match = re.search(r'M10[49]\s+S(\d+)', clean)
+                if match and int(match.group(1)) > 0:
+                    hotend_temp = int(match.group(1))
+            if bed_temp is None:
+                match = re.search(r'M1[49]0\s+S(\d+)', clean)
+                if match and int(match.group(1)) > 0:
+                    bed_temp = int(match.group(1))
+            if bed_temp is not None and hotend_temp is not None:
+                break
+
+        return bed_temp, hotend_temp
+
+    def extract_state_lines(self, content, resume_line):
+        """Collect state commands the resumed print still needs.
+
+        The cut discards the start section, losing state the remaining G-code
+        relies on: EXCLUDE_OBJECT_DEFINE (EXCLUDE_OBJECT_START errors without
+        it), SKEW_PROFILE LOAD, and M900 pressure/linear advance.
+        """
+        state_lines = []
+        for line in content[:resume_line]:
+            stripped = line.strip()
+            if (stripped.startswith('EXCLUDE_OBJECT_DEFINE')
+                    or (stripped.startswith('SKEW_PROFILE') and 'LOAD=' in stripped)
+                    or stripped.startswith('M900')):
+                if stripped + '\n' not in state_lines:
+                    state_lines.append(stripped + '\n')
+        return state_lines
+
     def find_layer_changes_with_z(self, content):
         """Find all layer change markers with their Z heights from slicer comments.
 
@@ -178,6 +228,75 @@ class PrintResumeTool:
             i += 1
 
         return layers
+
+    def split_into_segments(self, layers):
+        """Split the layer list into segments at Z resets.
+
+        Sequential ("print by object") files print each object bottom-to-top
+        in turn, so Z restarts for every object. Each segment is one object's
+        list of (line_number, z_height) tuples.
+        """
+        segments = []
+        current = []
+        prev_z = None
+        for line_num, z in layers:
+            if prev_z is not None and z < prev_z:
+                segments.append(current)
+                current = []
+            current.append((line_num, z))
+            prev_z = z
+        if current:
+            segments.append(current)
+        return segments
+
+    def segment_object_name(self, content, segment):
+        """Best-effort object name for a segment from EXCLUDE_OBJECT_START markers."""
+        start_line = segment[0][0]
+        end_line = segment[-1][0]
+        pattern = re.compile(r'EXCLUDE_OBJECT_START\s+NAME=(\S+)')
+        for line in content[start_line:end_line]:
+            match = pattern.search(line)
+            if match:
+                return match.group(1)
+        return None
+
+    def select_segment(self, content, segments, target_height):
+        """Pick the object segment to resume in.
+
+        Single-segment files pass through untouched. For sequential prints the
+        target height can exist in several objects, so we auto-select only when
+        exactly one object reaches it — otherwise --object is required.
+        """
+        if len(segments) == 1:
+            return segments[0]
+
+        threshold = target_height - self.layer_height
+        candidates = [i for i, seg in enumerate(segments) if seg[-1][1] >= threshold]
+
+        def describe():
+            print(f"\nSequential print detected: {len(segments)} objects (Z restarts between them)")
+            for i, seg in enumerate(segments):
+                name = self.segment_object_name(content, seg) or 'unknown'
+                marker = '  <- reaches target height' if i in candidates else ''
+                print(f"  --object {i + 1}: {name}  "
+                      f"Z {seg[0][1]}-{seg[-1][1]}mm, lines {seg[0][0]}-{seg[-1][0]}{marker}")
+
+        if self.object_index is not None:
+            if not 1 <= self.object_index <= len(segments):
+                describe()
+                sys.exit(f"\nError: --object {self.object_index} out of range (1-{len(segments)})")
+            return segments[self.object_index - 1]
+
+        if len(candidates) == 1:
+            seg = segments[candidates[0]]
+            name = self.segment_object_name(content, seg) or 'unknown'
+            print(f"Sequential print: auto-selected object {candidates[0] + 1} ({name}) — "
+                  f"the only one that reaches {target_height}mm")
+            return seg
+
+        describe()
+        sys.exit("\nError: the target height exists in multiple objects. "
+                 "Re-run with --object N for the object that failed.")
 
     def find_layer_changes(self, content):
         """Find all layer change markers in G-code (legacy method)"""
@@ -229,6 +348,11 @@ class PrintResumeTool:
 
         if layers_with_z:
             print(f"Found {len(layers_with_z)} layers with Z markers")
+
+            # Sequential prints: narrow to the failed object's segment first,
+            # otherwise the same height matches the wrong object
+            segments = self.split_into_segments(layers_with_z)
+            layers_with_z = self.select_segment(content, segments, target_height)
 
             # Find first layer where Z >= target - layer_height
             threshold = target_height - self.layer_height
@@ -340,18 +464,19 @@ class PrintResumeTool:
 
         return filtered_content
 
-    def create_resume_header(self):
-        """Create G-code header for resume with automated workflow.
+    def create_resume_header(self, state_lines=None):
+        """Create G-code header for the no-pause resume workflow.
 
-        Workflow:
-        1. Heat bed and hotend to original temperatures
-        2. Home X and Y axes only (Z left unhomed for free movement)
-        3. Set fake Z=200 so soft limits allow full downward jogging
-        4. PAUSE - user manually jogs Z down to resume height
-        5. After RESUME: set real Z position and continue printing
+        The user positions the nozzle manually BEFORE starting this file;
+        the file then declares that position as the resume height and prints.
+
+        No PAUSE is used: park-and-restore RESUME macros (Mainsail's
+        RESTORE_GCODE_STATE MOVE=1) move back to the pre-jog position, which
+        either errors with "Move out of range" or resumes in mid-air.
         """
+        gap = self.layer_height
         header = [
-            '; === PRINT RESUME TOOL ===\n',
+            '; === PRINT RESUME TOOL (no-pause workflow) ===\n',
             '; Resume height: {:.2f}mm\n'.format(self.resume_height),
             '; Layer height: {:.2f}mm\n'.format(self.layer_height),
         ]
@@ -363,24 +488,32 @@ class PrintResumeTool:
 
         header.extend([
             ';\n',
-            '; WORKFLOW:\n',
-            '; 1. File will heat bed and nozzle automatically\n',
-            '; 2. File will home X and Y (Z left unhomed for free movement)\n',
-            '; 3. Printer will PAUSE - jog Z down to {:.2f}mm manually\n'.format(self.resume_height),
-            '; 4. Click RESUME to continue printing\n',
+            '; PREP - do this in the console/jog panel BEFORE starting this file:\n',
+            ';   1. SET_KINEMATIC_POSITION Z=200   (unlocks Z jogging; NEVER home Z)\n',
+            ';   2. Raise Z ~20mm, then home X and Y only: G28 X Y\n',
+            ';   3. Preheat bed and nozzle, wipe ooze off the nozzle\n',
+            ';   4. Jog the nozzle to ~{:.1f}mm ABOVE the highest point of the print\n'.format(gap),
+            ';      (one layer height - a folded piece of paper as feeler gauge works)\n',
+            ';   5. Start this file - it declares that position as Z={:.2f} and prints\n'.format(self.resume_height),
+            ';      the first layer flush on the top surface (the offsets cancel)\n',
+            ';\n',
+            '; If something goes wrong: CANCEL_PRINT, re-jog, start again.\n',
+            '; Do NOT use PAUSE/RESUME - park-and-restore macros break this workflow.\n',
+            '; If XY is misaligned, correct live: SET_GCODE_OFFSET X=.. Y=.. MOVE=1\n',
+            '; (and reset with SET_GCODE_OFFSET X=0 Y=0 after the print).\n',
             ';\n',
             '\n',
             '; === START RESUME SEQUENCE ===\n',
             '\n',
-            'M117 Resume: heating up...\n',
-            'RESPOND MSG="Resume print: heating bed and nozzle"\n',
+            'M117 Resuming from {:.2f}mm\n'.format(self.resume_height),
+            'RESPOND MSG="Resume print: continuing from Z={:.2f}mm"\n'.format(self.resume_height),
             '\n',
             '; Set absolute positioning\n',
             'G90\n',
             '\n',
         ])
 
-        # Add temperature commands if available
+        # Add temperature commands if available (instant if preheated per PREP)
         if self.bed_temp and self.hotend_temp:
             header.extend([
                 '; Heat bed and nozzle\n',
@@ -412,24 +545,8 @@ class PrintResumeTool:
             ])
 
         header.extend([
-            '; Home X and Y axes\n',
-            'M117 Resume: homing X Y...\n',
-            'RESPOND MSG="Resume print: homing X and Y"\n',
-            'G28 X Y\n',
-            '\n',
-            '; Set Z high so soft limits allow full downward jogging\n',
-            'SET_KINEMATIC_POSITION Z=200\n',
-            '\n',
-            '; === PAUSE FOR MANUAL NOZZLE POSITIONING ===\n',
-            '; Z is NOT homed - jog Z freely to position nozzle at the print surface\n',
-            'M117 jog Z to {:.2f}mm then RESUME\n'.format(self.resume_height),
-            'RESPOND MSG="ACTION: Jog nozzle DOWN to Z={:.2f}mm (Z not homed - free movement), then click RESUME"\n'.format(self.resume_height),
-            'PAUSE\n',
-            '\n',
-            '; === AFTER RESUME ===\n',
-            'M117 Resume: printing from {:.2f}mm\n'.format(self.resume_height),
-            'RESPOND MSG="Resume print: continuing from Z={:.2f}mm"\n'.format(self.resume_height),
-            '; Tell Klipper the current physical Z position without moving motors\n',
+            '; Declare the manually-jogged nozzle position as the resume height\n',
+            '; (no motors move; requires the PREP steps above to be done)\n',
             'SET_KINEMATIC_POSITION Z={:.3f}\n'.format(self.resume_height),
             '\n',
             '; Reset extruder position\n',
@@ -439,6 +556,14 @@ class PrintResumeTool:
             'M83 ; Extruder relative mode\n',
             'G90 ; Absolute positioning\n',
             '\n',
+        ])
+
+        if state_lines:
+            header.append('; Restore state normally set by the start section\n')
+            header.extend(state_lines)
+            header.append('\n')
+
+        header.extend([
             '; === BEGIN RESUMED PRINT ===\n',
             '\n',
         ])
@@ -455,13 +580,19 @@ class PrintResumeTool:
         with open(self.gcode_file, 'r') as f:
             content = f.readlines()
 
-        # Extract temperatures if not provided via command line
+        # Find where to resume
+        resume_line = self.find_resume_layer(content, self.resume_height)
+        print(f"Resuming from line {resume_line}")
+
+        # Extract temperatures if not provided via command line: prefer the
+        # temps active at the cut (print temp), fall back to the start section
         if self.bed_temp is None or self.hotend_temp is None:
-            detected_bed, detected_hotend = self.extract_temperatures(content)
+            near_bed, near_hotend = self.extract_temperatures_at(content, resume_line)
+            start_bed, start_hotend = self.extract_temperatures(content)
             if self.bed_temp is None:
-                self.bed_temp = detected_bed
+                self.bed_temp = near_bed if near_bed is not None else start_bed
             if self.hotend_temp is None:
-                self.hotend_temp = detected_hotend
+                self.hotend_temp = near_hotend if near_hotend is not None else start_hotend
 
         if self.bed_temp:
             print(f"Bed temperature: {self.bed_temp}°C")
@@ -473,9 +604,10 @@ class PrintResumeTool:
         else:
             print("Warning: Hotend temperature not detected")
 
-        # Find where to resume
-        resume_line = self.find_resume_layer(content, self.resume_height)
-        print(f"Resuming from line {resume_line}")
+        # Carry over state the cut discards (object defines, skew, M900)
+        state_lines = self.extract_state_lines(content, resume_line)
+        for line in state_lines:
+            print(f"Carrying over: {line.strip()[:60]}")
 
         # Extract from resume point
         resumed_content = content[resume_line:]
@@ -485,7 +617,7 @@ class PrintResumeTool:
 
         # Create new file with resume header
         output_content = []
-        output_content.extend(self.create_resume_header())
+        output_content.extend(self.create_resume_header(state_lines))
         output_content.extend(cleaned_content)
 
         # Write output file
@@ -493,14 +625,16 @@ class PrintResumeTool:
             f.writelines(output_content)
 
         print(f"\n✓ Created resume file: {self.output_file}")
-        print("\n=== WORKFLOW ===")
+        print("\n=== WORKFLOW (no-pause: position the nozzle BEFORE starting) ===")
         print(f"1. Upload {self.output_file} to your printer")
-        print("2. Start the print")
-        print("3. Printer will heat up and home X/Y automatically")
-        print("4. Printer will PAUSE")
-        print(f"5. Manually move nozzle to Z={self.resume_height}mm")
-        print("6. Click RESUME to continue printing")
-        print("\n⚠️  IMPORTANT: Monitor first few layers carefully!")
+        print("2. Console: SET_KINEMATIC_POSITION Z=200   (unlocks Z jogging; NEVER home Z)")
+        print("3. Raise Z ~20mm, then home X and Y only: G28 X Y")
+        print("4. Preheat bed and nozzle, wipe ooze off the nozzle")
+        print(f"5. Jog the nozzle to ~{self.layer_height}mm ABOVE the print's highest point")
+        print("6. Start the file - the first layer lands flush on the top surface")
+        print("\n⚠️  Monitor the first layers! If XY is off, fix live with")
+        print("   SET_GCODE_OFFSET X=.. Y=.. MOVE=1 (reset to 0 after the print).")
+        print("   If it goes wrong: CANCEL_PRINT and re-jog - never PAUSE.")
 
     def create_macro_version(self):
         """Create a Klipper macro for easy use"""

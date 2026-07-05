@@ -98,30 +98,65 @@ python3 resume_print.py your_print.gcode \
 #### Command Line Options
 - `gcode_file` - Original G-code file to process (required)
 - `--height, -z` - Z-height to resume from in mm (required)
+- `--object` - For sequential ("by object") prints: 1-based index of the failed object (run without it to list objects)
 - `--output, -o` - Output filename (default: `original_resumed.gcode`)
 - `--layer-height, -lh` - Layer height in mm (default: 0.2)
 - `--safe-z-home-x` - X coordinate for safe Z homing (default: 0)
 - `--safe-z-home-y` - Y coordinate for safe Z homing (default: 30)
+
+#### Sequential ("Print by Object") Files
+
+In sequential prints Z restarts at the bottom for every object, so the same
+height can exist in multiple objects. The script detects Z resets and, when
+the target height is ambiguous, lists the objects and asks for `--object N`:
+
+```
+Sequential print detected: 3 objects (Z restarts between them)
+  --object 1: Stud_4_7mm...  Z 0.2-15.2mm, lines 213-11880
+  --object 2: Stud_6mm...    Z 0.2-23.0mm, lines 11919-18452  <- reaches target height
+  --object 3: Funnel...      Z 0.2-93.5mm, lines 18583-295590 <- reaches target height
+
+Error: the target height exists in multiple objects. Re-run with --object N for the object that failed.
+```
+
+If only one object reaches the target height it is selected automatically.
 
 #### Example Output
 ```
 Processing: benchy.gcode
 Resume height: 15.20mm
 Layer height: 0.20mm
+Found 152 layers with Z markers
+Found resume layer at Z:15.0mm (line 4523)
 Resuming from line 4523
+Bed temperature: 60°C
+Hotend temperature: 200°C
+Carrying over: M900 K0.05 ; Filament gcode LA 1.5
 
 ✓ Created resume file: benchy_resumed.gcode
 
-=== NEXT STEPS ===
-1. Heat bed to print temperature
-2. Heat nozzle to print temperature
-3. Home XY: G28 X Y
-4. Home Z at safe position: G28 Z (or use safe_z_home)
-5. Manually move nozzle to resume height
-6. Start print: benchy_resumed.gcode
+=== WORKFLOW (no-pause: position the nozzle BEFORE starting) ===
+1. Upload benchy_resumed.gcode to your printer
+2. Console: SET_KINEMATIC_POSITION Z=200   (unlocks Z jogging; NEVER home Z)
+3. Raise Z ~20mm, then home X and Y only: G28 X Y
+4. Preheat bed and nozzle, wipe ooze off the nozzle
+5. Jog the nozzle to ~0.2mm ABOVE the print's highest point
+6. Start the file - the first layer lands flush on the top surface
 
-⚠️  IMPORTANT: Monitor first few layers carefully!
+⚠️  Monitor the first layers! If XY is off, fix live with
+   SET_GCODE_OFFSET X=.. Y=.. MOVE=1 (reset to 0 after the print).
+   If it goes wrong: CANCEL_PRINT and re-jog - never PAUSE.
 ```
+
+#### Why No PAUSE?
+
+Earlier versions embedded a `PAUSE` in the resume file and had you jog the
+nozzle mid-print, then click RESUME. That breaks on printers whose RESUME
+macro parks and restores position (`RESTORE_GCODE_STATE MOVE=1`, e.g.
+Mainsail's client macros): RESUME moves back to the pre-jog position, which
+either fails with `Move out of range` or resumes printing in mid-air. The
+generated file now contains no PAUSE — you position the nozzle first, and
+starting the file stamps that position as the resume height.
 
 ### Method 2: Klipper Macros
 
